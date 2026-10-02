@@ -20,6 +20,9 @@ namespace rocjitsu::amdgpu {
 
 enum class SdmaPacketDialect {
   Legacy,
+  /// Legacy packet layout with 30-bit linear-copy counts (gfx90a, gfx94x,
+  /// gfx95x, and gfx103x). Broadcast copies retain their 22-bit count.
+  LegacyExtendedCount,
   Gfx11Plus,
   Gfx1250,
 };

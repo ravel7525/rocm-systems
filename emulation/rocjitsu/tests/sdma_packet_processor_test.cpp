@@ -29,17 +29,17 @@ static_assert(std::same_as<decltype(std::declval<SdmaPacketProcessRequest>().con
 
 class RetryMemory final : public AddressSpaceTranslator, public PhysicalMemoryAccess {
 public:
-  RetryMemory() : bytes_(0x10000) {}
+  explicit RetryMemory(std::size_t size = 0x10000, uint64_t segment_size = 16)
+      : bytes_(size), segment_size_(segment_size) {}
 
   VmTranslationResult translate(uint64_t address, std::size_t size, VmAccessKind) const override {
     if (size == 0 || address > bytes_.size() || size > bytes_.size() - address)
       return {.outcome = VmAccessOutcome::Faulted, .translation = {}};
-    constexpr uint64_t kSegment = 16;
     return {
         .outcome = VmAccessOutcome::Complete,
         .translation = {.domain = VmMemoryDomain::System,
                         .address = address,
-                        .contiguous_bytes = kSegment - (address % kSegment),
+                        .contiguous_bytes = segment_size_ - (address % segment_size_),
                         .mtype = Mtype::RW,
                         .permissions = {.readable = true, .writable = true, .executable = true}}};
   }
@@ -119,6 +119,7 @@ public:
 
 private:
   std::vector<std::byte> bytes_;
+  uint64_t segment_size_;
   std::map<uint64_t, uint32_t> write_calls_;
   uint64_t unavailable_write_address_ = UINT64_MAX;
   uint64_t unavailable_atomic_store_address_ = UINT64_MAX;
@@ -148,6 +149,60 @@ std::array<uint32_t, 7> copy_packet(uint64_t source, uint64_t destination, uint3
           static_cast<uint32_t>(source >> 32),
           static_cast<uint32_t>(destination),
           static_cast<uint32_t>(destination >> 32)};
+}
+
+TEST(SdmaPacketProcessorTest, ExtendedCountCopiesBeyondFourMiB) {
+  constexpr uint64_t kSource = 0x1000;
+  constexpr uint64_t kDestination = 0x500000;
+  constexpr uint32_t kBytes = 0x400010;
+  for (const auto dialect : {SdmaPacketDialect::Legacy, SdmaPacketDialect::LegacyExtendedCount,
+                             SdmaPacketDialect::Gfx11Plus, SdmaPacketDialect::Gfx1250}) {
+    SCOPED_TRACE(static_cast<int>(dialect));
+    auto memory = std::make_shared<RetryMemory>(kDestination + kBytes, 0x1000);
+    // Check both ends of the transfer and the first byte beyond the legacy limit.
+    memory->store<uint32_t>(kSource, 0x12345678);
+    memory->store<uint32_t>(kSource + 0x400000, 0x87654321);
+    memory->store<uint32_t>(kSource + kBytes - 4, 0xabcdef01);
+    GpuVm vm;
+    const auto handle = vm.register_translated(7, memory, memory);
+    const auto access = vm.snapshot(handle);
+    ASSERT_TRUE(access);
+    SdmaPacketContinuation continuation;
+    SdmaPacketProcessor processor(dialect);
+    auto packet = copy_packet(kSource, kDestination, kBytes);
+    packet[1] |= 0xc0000000; // Reserved high bits must not extend the transfer.
+    const auto result = processor.process(
+        {.available_dwords = packet, .access = *access, .continuation = continuation});
+    ASSERT_EQ(result.packet.status, PacketProcessStatus::Complete);
+    EXPECT_FALSE(continuation.pending());
+    EXPECT_EQ(memory->load<uint32_t>(kDestination), 0x12345678u);
+    if (dialect == SdmaPacketDialect::Legacy) {
+      EXPECT_EQ(memory->load<uint32_t>(kDestination + 0x400000), 0u);
+      EXPECT_EQ(memory->load<uint32_t>(kDestination + kBytes - 4), 0u);
+    } else {
+      EXPECT_EQ(memory->load<uint32_t>(kDestination + 0x400000), 0x87654321u);
+      EXPECT_EQ(memory->load<uint32_t>(kDestination + kBytes - 4), 0xabcdef01u);
+    }
+  }
+}
+
+TEST(SdmaPacketProcessorTest, ExtendedCountPreservesLegacyBroadcastLayout) {
+  PacketProcessorFixture fixture;
+  ASSERT_TRUE(fixture.access);
+  fixture.memory->store<uint32_t>(0x100, 0x12345678);
+  SdmaPacketProcessor processor(SdmaPacketDialect::LegacyExtendedCount);
+  // Legacy broadcast uses header bit 28 and a 22-bit count even on targets
+  // whose ordinary linear copies use 30-bit counts.
+  const std::array<uint32_t, 9> packet = {1u | (1u << 28), 0xffc00003, 0,     0x100, 0,
+                                          0x200,           0,          0x300, 0};
+  const auto result = processor.process({.available_dwords = packet,
+                                         .access = *fixture.access,
+                                         .continuation = fixture.continuation});
+  ASSERT_EQ(result.packet.status, PacketProcessStatus::Complete);
+  EXPECT_EQ(fixture.memory->load<uint32_t>(0x200), 0x12345678u);
+  EXPECT_EQ(fixture.memory->load<uint32_t>(0x300), 0x12345678u);
+  EXPECT_EQ(fixture.memory->write_calls(0x204), 0u);
+  EXPECT_EQ(fixture.memory->write_calls(0x304), 0u);
 }
 
 TEST(SdmaPacketProcessorTest, CopyResumesAtFirstUncommittedPhysicalSpan) {

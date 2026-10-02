@@ -294,7 +294,9 @@ private:
     return frame.words[frame.at + offset];
   }
 
-  bool gfx11_plus() const { return dialect_ != SdmaPacketDialect::Legacy; }
+  bool gfx11_plus() const {
+    return dialect_ == SdmaPacketDialect::Gfx11Plus || dialect_ == SdmaPacketDialect::Gfx1250;
+  }
 
   PacketExtent packet_extent(std::span<const uint32_t> words) const {
     const auto need = [&](std::size_t dwords) {
